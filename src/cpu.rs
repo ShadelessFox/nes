@@ -42,26 +42,37 @@ pub struct CPU {
     pub(crate) pc: u16,
 
     lookup_table: HashMap<u8, Instruction>,
+    cycles: usize,
 }
 
 #[derive(Copy, Clone)]
 struct Instruction {
     name: &'static str,
     addr: &'static dyn Fn(&mut CPU) -> u16,
-    inst: &'static dyn Fn(&mut CPU, u16) -> (),
-    cycles: u8,
+    inst: &'static dyn Fn(&mut CPU, u16) -> usize,
+    cycles: usize,
 }
 
 impl CPU {
     pub fn new(bus: Rc<RefCell<Bus>>) -> CPU {
-        let mut cpu = CPU { bus, acc: 0, idx: 0, idy: 0, ps: 0, sp: 0, pc: 0, lookup_table: Self::build_lookup_table() };
+        let mut cpu = CPU {
+            bus,
+            acc: 0,
+            idx: 0,
+            idy: 0,
+            ps: 0,
+            sp: 0,
+            pc: 0,
+            lookup_table: Self::build_lookup_table(),
+            cycles: 0,
+        };
         cpu.set_flag(Flag::Zero, true);
         cpu.set_flag(Flag::Interrupt, true);
         cpu
     }
 
     pub fn cycle(&mut self) {
-        print!("{:04X} | A = ${:02X}, X = ${:02X}, Y = ${:02X}, PC = ${:04X}, P = ${:02X} [{}{}{}{}{}{}] | ", self.pc, self.acc, self.idx, self.idy, self.pc, self.ps, if self.get_flag(Flag::Negative) { "N" } else { "-" }, if self.get_flag(Flag::Overflow) { "V" } else { "-" }, if self.get_flag(Flag::Decimal) { "D" } else { "-" }, if self.get_flag(Flag::Interrupt) { "I" } else { "-" }, if self.get_flag(Flag::Zero) { "Z" } else { "-" }, if self.get_flag(Flag::Carry) { "C" } else { "-" });
+        print!("{:04X} | A = ${:02X}, X = ${:02X}, Y = ${:02X}, PC = ${:04X}, P = ${:02X} [{}{}{}{}{}{}], C: {:10} | ", self.pc, self.acc, self.idx, self.idy, self.pc, self.ps, if self.get_flag(Flag::Negative) { "N" } else { "-" }, if self.get_flag(Flag::Overflow) { "V" } else { "-" }, if self.get_flag(Flag::Decimal) { "D" } else { "-" }, if self.get_flag(Flag::Interrupt) { "I" } else { "-" }, if self.get_flag(Flag::Zero) { "Z" } else { "-" }, if self.get_flag(Flag::Carry) { "C" } else { "-" }, self.cycles);
 
         let opcode = self.fetch_u8();
 
@@ -69,7 +80,8 @@ impl CPU {
             Some(instruction) => {
                 println!("{}", instruction.name);
                 let addr = (instruction.addr)(self);
-                let _cycles = (instruction.inst)(self, addr);
+                self.cycles += (instruction.inst)(self, addr);
+                self.cycles += instruction.cycles as usize
             }
             None => panic!("Unknown opcode ${:#02X} at pc ${:#02X}", opcode, self.pc - 1)
         }
@@ -155,98 +167,117 @@ impl CPU {
         }
     }
 
-    fn ldx(&mut self, value: u16) {
+    fn ldx(&mut self, value: u16) -> usize {
         let value = value as u8;
         self.idx = value;
         self.set_flag(Flag::Zero, value == 0);
         self.set_flag(Flag::Negative, value >= 128);
+        0 // TODO: Take in account page boundary crossing
     }
 
-    fn ldy(&mut self, value: u16) {
+    fn ldy(&mut self, value: u16) -> usize {
         let value = value as u8;
         self.idy = value;
         self.set_flag(Flag::Zero, value == 0);
         self.set_flag(Flag::Negative, value >= 128);
+        0 // TODO: Take in account page boundary crossing
     }
 
-    fn lda(&mut self, value: u16) {
+    fn lda(&mut self, value: u16) -> usize {
         let value = value as u8;
         self.acc = value;
         self.set_flag(Flag::Zero, value == 0);
         self.set_flag(Flag::Negative, value >= 128);
+        0 // TODO: Take in account page boundary crossing
     }
 
-    fn sta(&mut self, value: u16) {
+    fn sta(&mut self, value: u16) -> usize {
         self.bus.borrow_mut().write_u8(value, self.acc);
+        0
     }
 
-    fn stx(&mut self, value: u16) {
+    fn stx(&mut self, value: u16) -> usize {
         self.bus.borrow_mut().write_u8(value, self.idx);
+        0
     }
 
-    fn sty(&mut self, value: u16) {
+    fn sty(&mut self, value: u16) -> usize {
         self.bus.borrow_mut().write_u8(value, self.idy);
+        0
     }
 
-    fn dex(&mut self, _: u16) {
+    fn dex(&mut self, _: u16) -> usize {
         let value = self.idx.overflowing_sub(1).0;
         self.idx = value;
         self.set_flag(Flag::Zero, value == 0);
         self.set_flag(Flag::Negative, value >= 128);
+        0
     }
 
-    fn dey(&mut self, _: u16) {
+    fn dey(&mut self, _: u16) -> usize {
         let value = self.idy.overflowing_sub(1).0;
         self.idy = value;
         self.set_flag(Flag::Zero, value == 0);
         self.set_flag(Flag::Negative, value >= 128);
+        0
     }
 
-    fn bne(&mut self, value: u16) {
+    fn bne(&mut self, value: u16) -> usize {
         if !self.get_flag(Flag::Zero) {
             self.pc = value;
         }
+        0 // TODO: Take in account page boundary crossing
     }
 
-    fn bpl(&mut self, value: u16) {
+    fn bpl(&mut self, value: u16) -> usize {
         if !self.get_flag(Flag::Negative) {
             self.pc = value;
         }
+        0 // TODO: Take in account page boundary crossing
     }
 
-    fn jsr(&mut self, value: u16) {
+    fn jsr(&mut self, value: u16) -> usize {
         self.push_u16(self.pc - 1);
         self.pc = value;
+        0
     }
 
-    fn pha(&mut self, _: u16) {
+    fn pha(&mut self, _: u16) -> usize {
         self.push_u8(self.acc);
+        0
     }
 
-    fn bit(&mut self, value: u16) {
+    fn bit(&mut self, value: u16) -> usize {
         let value = value as u8;
         self.set_flag(Flag::Negative, value >> 6 & 1 == 1);
         self.set_flag(Flag::Overflow, value >> 7 & 1 == 1);
         self.set_flag(Flag::Zero, value & self.acc == 0);
+        0
     }
 
-    fn sei(&mut self, _: u16) {
+    fn sei(&mut self, _: u16) -> usize {
         self.set_flag(Flag::Interrupt, true);
+        0
     }
 
-    fn sec(&mut self, _: u16) {
+    fn sec(&mut self, _: u16) -> usize {
         self.set_flag(Flag::Carry, true);
+        0
     }
 
-    fn cld(&mut self, _: u16) {
+    fn cld(&mut self, _: u16) -> usize {
         self.set_flag(Flag::Decimal, false);
+        0
     }
 
-    fn txs(&mut self, _: u16) {
-        self.sp = self.idx
+    fn txs(&mut self, _: u16) -> usize {
+        self.sp = self.idx;
+        0
     }
 
-    fn nop(&mut self, _: u16) {}
+    fn nop(&mut self, _: u16) -> usize {
+        0
+    }
 
     fn build_lookup_table() -> HashMap<u8, Instruction> {
         let make = |name, addr, inst, cycles| Instruction { name, addr, inst, cycles };
