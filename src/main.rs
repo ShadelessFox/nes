@@ -1,39 +1,33 @@
 use std::cell::RefCell;
 use std::fs::File;
-use std::io::{Error, Read, Seek, SeekFrom};
+use std::io::Error;
 use std::rc::Rc;
 
-use bus::Bus;
+use cartridge::Cartridge;
+use cpu::CPU;
+use ppu::PPU;
+use ram::RAM;
 
-use crate::cpu::CPU;
+use crate::bus::Bus;
 
-mod bus;
-mod cpu;
-mod ppu;
+pub mod bus;
+pub mod cpu;
+pub mod ppu;
+pub mod ram;
+pub mod cartridge;
+
+const CARTRIDGE_PATH: &str = "roms/nestest.nes";
 
 fn main() -> Result<(), Error> {
-    let bus = Rc::new(RefCell::new(Bus { ram: Box::new([0; 0x10000]) }));
-
-    let rom = load_rom_from_nes(&mut File::open("roms/nestest.nes")?)?;
-    bus.borrow_mut().write((0x10000 - rom.len()) as u16, &rom);
-
-    let mut reset: [u8; 2] = [0, 0];
-    bus.borrow_mut().read(0xfffc as u16, &mut reset);
+    let bus = Rc::new(RefCell::new(Bus::new()));
+    bus.borrow_mut().mount(Box::new(RAM::new()), 0x0000..=0x1fff).unwrap();
+    bus.borrow_mut().mount(Box::new(PPU::new()), 0x2000..=0x2007).unwrap();
+    bus.borrow_mut().mount(Box::new(Cartridge::from_file(&mut File::open(CARTRIDGE_PATH)?)?), 0x4020..=0xffff).unwrap();
 
     let mut cpu = CPU::new(bus.clone());
-    cpu.pc = u16::from_le_bytes(reset);
+    cpu.reset();
 
     loop {
         cpu.cycle();
     }
-}
-
-fn load_rom_from_nes(file: &mut File) -> Result<Vec<u8>, Error> {
-    file.seek(SeekFrom::Start(4))?;
-    let mut rom_pages = [0u8];
-    file.read(&mut rom_pages)?;
-    file.seek(SeekFrom::Start(16))?;
-    let mut buf = vec![0; rom_pages[0] as usize * 16384];
-    file.read_exact(&mut buf)?;
-    Ok(buf)
 }
