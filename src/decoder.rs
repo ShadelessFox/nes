@@ -1,39 +1,17 @@
 use std::collections::HashMap;
+use std::fmt::{Debug, Display, Formatter};
 
 use crate::bus::Address;
 
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
 pub enum Operand {
-    Absolute(Address),
-    Relative(i8),
     Immediate(u8),
-}
-
-impl Operand {
-    pub fn as_absolute(&self) -> Address {
-        match self {
-            Operand::Absolute(x) => *x,
-            _ => panic!("Not an absolute address")
-        }
-    }
-
-    pub fn as_relative(&self, address: Address) -> Address {
-        match self {
-            Operand::Relative(x) => (address as i16 + *x as i16) as u16,
-            _ => panic!("Not a relative address")
-        }
-    }
-
-    pub fn as_immediate(&self) -> u8 {
-        match self {
-            Operand::Immediate(x) => *x,
-            _ => panic!("Not an immediate")
-        }
-    }
+    Memory(Address),
+    Branch(i8),
 }
 
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
-pub enum Operation {
+pub enum Mnemonic {
     ADC,
     AND,
     ASL,
@@ -108,28 +86,9 @@ pub enum Addressing {
     Implied,
 }
 
-impl Addressing {
-    fn fetch_operand(&self, d: &mut Decoder) -> Result<Option<Operand>, String> {
-        match self {
-            Addressing::Immediate => Ok(Some(Operand::Immediate(d.fetch_next_u8()?))),
-            Addressing::ZeroPage |
-            Addressing::ZeroPageX |
-            Addressing::ZeroPageY => Ok(Some(Operand::Absolute(d.fetch_next_u8()? as u16))),
-            Addressing::Absolute |
-            Addressing::AbsoluteX |
-            Addressing::AbsoluteY |
-            Addressing::Indirect => Ok(Some(Operand::Absolute(d.fetch_next_u16()?))),
-            Addressing::IndirectX |
-            Addressing::IndirectY => Ok(Some(Operand::Absolute(d.fetch_next_u8()? as u16))),
-            Addressing::Relative => Ok(Some(Operand::Relative(d.fetch_next_u8()? as i8))),
-            Addressing::Implied => Ok(None),
-        }
-    }
-}
-
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
 pub struct Instruction {
-    operation: Operation,
+    mnemonic: Mnemonic,
     operand: Option<Operand>,
     addressing: Addressing,
     pos: usize,
@@ -137,17 +96,57 @@ pub struct Instruction {
     cycles: usize,
 }
 
-#[derive(Debug, Copy, Clone, Eq, PartialEq)]
-struct InstructionInfo {
-    operation: Operation,
-    addressing: Addressing,
-    cycles: usize,
+impl Instruction {
+    pub fn immediate(&self) -> Option<u8> {
+        match self.operand {
+            Some(Operand::Immediate(x)) => Some(x),
+            _ => None
+        }
+    }
+
+    pub fn memory(&self) -> Option<Address> {
+        match self.operand {
+            Some(Operand::Memory(x)) => Some(x),
+            _ => None
+        }
+    }
+
+    pub fn branch(&self, start: Address) -> Option<Address> {
+        match self.operand {
+            Some(Operand::Branch(x)) => Some((start as i16 + x as i16) as Address),
+            _ => None
+        }
+    }
+}
+
+impl Display for Instruction {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        let mut pos = self.pos + self.len;
+        if let Some(start) = f.width() {
+            pos += start;
+        }
+        Debug::fmt(&self.mnemonic, f)?;
+        match self.addressing {
+            Addressing::Immediate => f.write_fmt(format_args!(" #${:02X}", self.immediate().unwrap())),
+            Addressing::ZeroPage => f.write_fmt(format_args!(" ${:02X}", self.memory().unwrap())),
+            Addressing::ZeroPageX => f.write_fmt(format_args!(" ${:02X},X", self.memory().unwrap())),
+            Addressing::ZeroPageY => f.write_fmt(format_args!(" ${:02X},Y", self.memory().unwrap())),
+            Addressing::Relative => f.write_fmt(format_args!(" ${:04X}", self.branch(pos as u16).unwrap())),
+            Addressing::Absolute => f.write_fmt(format_args!(" ${:04X}", self.memory().unwrap())),
+            Addressing::AbsoluteX => f.write_fmt(format_args!(" ${:04X},X", self.memory().unwrap())),
+            Addressing::AbsoluteY => f.write_fmt(format_args!(" ${:04X},Y", self.memory().unwrap())),
+            Addressing::Indirect => f.write_fmt(format_args!(" (${:04X})", self.memory().unwrap())),
+            Addressing::IndirectX => f.write_fmt(format_args!(" (${:04X},X)", self.memory().unwrap())),
+            Addressing::IndirectY => f.write_fmt(format_args!(" (${:04X}),Y", self.memory().unwrap())),
+            Addressing::Implied => Ok(()),
+        }
+    }
 }
 
 pub struct Decoder<'a> {
     buf: &'a [u8],
     pos: usize,
-    lookup: HashMap<u8, InstructionInfo>,
+    lookup: HashMap<u8, (Mnemonic, Addressing, usize)>,
 }
 
 impl<'a> Decoder<'a> {
@@ -164,14 +163,14 @@ impl<'a> Decoder<'a> {
         let opcode = self.fetch_next_u8()?;
 
         match self.lookup.get(&opcode).cloned() {
-            Some(info) => {
+            Some((mnemonic, addressing, cycles)) => {
                 Ok(Instruction {
-                    operation: info.operation,
-                    operand: info.addressing.fetch_operand(self)?,
-                    addressing: info.addressing,
+                    mnemonic,
+                    operand: self.fetch_operand(addressing)?,
+                    addressing,
                     pos: start as usize,
                     len: self.pos - start,
-                    cycles: info.cycles,
+                    cycles,
                 })
             }
             None => Err(format!("Can't decode instruction at ${:04x}: ${:02x}", start, opcode)),
@@ -180,6 +179,23 @@ impl<'a> Decoder<'a> {
 
     pub fn can_decode(&self) -> bool {
         self.pos < self.buf.len()
+    }
+
+    fn fetch_operand(&mut self, addressing: Addressing) -> Result<Option<Operand>, String> {
+        match addressing {
+            Addressing::Immediate => Ok(Some(Operand::Immediate(self.fetch_next_u8()?))),
+            Addressing::ZeroPage |
+            Addressing::ZeroPageX |
+            Addressing::ZeroPageY => Ok(Some(Operand::Memory(self.fetch_next_u8()? as u16))),
+            Addressing::Absolute |
+            Addressing::AbsoluteX |
+            Addressing::AbsoluteY |
+            Addressing::Indirect => Ok(Some(Operand::Memory(self.fetch_next_u16()?))),
+            Addressing::IndirectX |
+            Addressing::IndirectY => Ok(Some(Operand::Memory(self.fetch_next_u8()? as u16))),
+            Addressing::Relative => Ok(Some(Operand::Branch(self.fetch_next_u8()? as i8))),
+            Addressing::Implied => Ok(None),
+        }
     }
 
     fn fetch_u8(&self, position: u16) -> Result<u8, String> {
@@ -198,13 +214,13 @@ impl<'a> Decoder<'a> {
         Ok(hi << 8 | lo)
     }
 
-    fn build_lookup_table() -> HashMap<u8, InstructionInfo> {
-        use Operation::*;
+    fn build_lookup_table() -> HashMap<u8, (Mnemonic, Addressing, usize)> {
+        use Mnemonic::*;
         use Addressing::*;
 
         let mut map = HashMap::new();
-        let mut put = |opcode, operation, addressing, cycles| {
-            assert_eq!(map.insert(opcode, InstructionInfo { operation, addressing, cycles }), None);
+        let mut put = |opcode, mnemonic, addressing, cycles| {
+            assert_eq!(map.insert(opcode, (mnemonic, addressing, cycles)), None);
         };
 
         // @formatter:off
@@ -404,7 +420,7 @@ mod tests {
     use std::fs::File;
     use std::io::{Error, Read, Seek, SeekFrom};
 
-    use crate::decoder::{Addressing, Decoder, Instruction, Operand, Operation};
+    use crate::decoder::{Addressing, Decoder, Instruction, Mnemonic, Operand};
 
     #[test]
     fn can_dump_rom() -> Result<(), Error> {
@@ -428,28 +444,10 @@ mod tests {
                     for byte in bytes.iter() {
                         print!(" {:02X}", byte);
                     }
-
                     for _ in 0..(3 - bytes.len()) {
                         print!("   ");
                     }
-
-                    print!(" | {:?}", instruction.operation);
-
-                    match instruction.addressing {
-                        Addressing::Immediate => println!(" #${:02X}", instruction.operand.unwrap().as_immediate()),
-                        Addressing::ZeroPage => println!(" ${:02X}", instruction.operand.unwrap().as_absolute()),
-                        Addressing::ZeroPageX => println!(" ${:02X},X", instruction.operand.unwrap().as_absolute()),
-                        Addressing::ZeroPageY => println!(" ${:02X},Y", instruction.operand.unwrap().as_absolute()),
-                        Addressing::Relative => println!(" ${:04X}", instruction.operand.unwrap().as_relative((instruction.pos + instruction.len + VIRT_DATA_START) as u16)),
-                        Addressing::Absolute => println!(" ${:04X}", instruction.operand.unwrap().as_absolute()),
-                        Addressing::AbsoluteX => println!(" ${:04X},X", instruction.operand.unwrap().as_absolute()),
-                        Addressing::AbsoluteY => println!(" ${:04X},Y", instruction.operand.unwrap().as_absolute()),
-                        Addressing::Indirect => println!(" (${:04X})", instruction.operand.unwrap().as_absolute()),
-                        Addressing::IndirectX => println!(" (${:04X},X)", instruction.operand.unwrap().as_absolute()),
-                        Addressing::IndirectY => println!(" (${:04X}),Y", instruction.operand.unwrap().as_absolute()),
-                        Addressing::Implied => println!(),
-                    }
-
+                    println!(" | {:start$}", instruction, start = VIRT_DATA_START);
                     last_decode_succeeded = true;
                 }
                 Err(_) => {
@@ -478,7 +476,7 @@ mod tests {
         ]);
 
         assert_eq!(decoder.decode(), Ok(Instruction {
-            operation: Operation::LDA,
+            mnemonic: Mnemonic::LDA,
             operand: Some(Operand::Immediate(0x01)),
             addressing: Addressing::Immediate,
             pos: 0,
@@ -487,8 +485,8 @@ mod tests {
         }));
 
         assert_eq!(decoder.decode(), Ok(Instruction {
-            operation: Operation::LDA,
-            operand: Some(Operand::Absolute(0x02)),
+            mnemonic: Mnemonic::LDA,
+            operand: Some(Operand::Memory(0x02)),
             addressing: Addressing::ZeroPage,
             pos: 2,
             len: 2,
@@ -496,8 +494,8 @@ mod tests {
         }));
 
         assert_eq!(decoder.decode(), Ok(Instruction {
-            operation: Operation::LDA,
-            operand: Some(Operand::Absolute(0x03)),
+            mnemonic: Mnemonic::LDA,
+            operand: Some(Operand::Memory(0x03)),
             addressing: Addressing::ZeroPageX,
             pos: 4,
             len: 2,
@@ -505,8 +503,8 @@ mod tests {
         }));
 
         assert_eq!(decoder.decode(), Ok(Instruction {
-            operation: Operation::LDA,
-            operand: Some(Operand::Absolute(0x4004)),
+            mnemonic: Mnemonic::LDA,
+            operand: Some(Operand::Memory(0x4004)),
             addressing: Addressing::Absolute,
             pos: 6,
             len: 3,
@@ -514,8 +512,8 @@ mod tests {
         }));
 
         assert_eq!(decoder.decode(), Ok(Instruction {
-            operation: Operation::LDA,
-            operand: Some(Operand::Absolute(0x5005)),
+            mnemonic: Mnemonic::LDA,
+            operand: Some(Operand::Memory(0x5005)),
             addressing: Addressing::AbsoluteX,
             pos: 9,
             len: 3,
@@ -523,8 +521,8 @@ mod tests {
         }));
 
         assert_eq!(decoder.decode(), Ok(Instruction {
-            operation: Operation::LDA,
-            operand: Some(Operand::Absolute(0x6006)),
+            mnemonic: Mnemonic::LDA,
+            operand: Some(Operand::Memory(0x6006)),
             addressing: Addressing::AbsoluteY,
             pos: 12,
             len: 3,
@@ -532,8 +530,8 @@ mod tests {
         }));
 
         assert_eq!(decoder.decode(), Ok(Instruction {
-            operation: Operation::LDA,
-            operand: Some(Operand::Absolute(0x07)),
+            mnemonic: Mnemonic::LDA,
+            operand: Some(Operand::Memory(0x07)),
             addressing: Addressing::IndirectX,
             pos: 15,
             len: 2,
@@ -541,8 +539,8 @@ mod tests {
         }));
 
         assert_eq!(decoder.decode(), Ok(Instruction {
-            operation: Operation::LDA,
-            operand: Some(Operand::Absolute(0x08)),
+            mnemonic: Mnemonic::LDA,
+            operand: Some(Operand::Memory(0x08)),
             addressing: Addressing::IndirectY,
             pos: 17,
             len: 2,
