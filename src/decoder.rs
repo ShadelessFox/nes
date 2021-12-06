@@ -1,220 +1,13 @@
 use std::collections::HashMap;
 use std::fmt::{Debug, Display, Formatter};
+use std::io::{Error, ErrorKind, Read, Seek, SeekFrom};
+
+use byteorder::{LittleEndian, ReadBytesExt};
 
 use crate::bus::Address;
 
-#[derive(Debug, Copy, Clone, Eq, PartialEq)]
-pub enum Operand {
-    Immediate(u8),
-    Memory(Address),
-    Branch(i8),
-}
-
-#[derive(Debug, Copy, Clone, Eq, PartialEq)]
-pub enum Mnemonic {
-    ADC,
-    AND,
-    ASL,
-    BCC,
-    BCS,
-    BEQ,
-    BIT,
-    BMI,
-    BNE,
-    BPL,
-    BRK,
-    BVC,
-    BVS,
-    CLC,
-    CLD,
-    CLI,
-    CLV,
-    CMP,
-    CPX,
-    CPY,
-    DEC,
-    DEX,
-    DEY,
-    EOR,
-    INC,
-    INX,
-    INY,
-    JMP,
-    JSR,
-    LDA,
-    LDX,
-    LDY,
-    SLR,
-    NOP,
-    ORA,
-    PHA,
-    PHP,
-    PLA,
-    PLP,
-    ROL,
-    ROR,
-    RTI,
-    RTS,
-    SBC,
-    SEC,
-    SED,
-    SEI,
-    STA,
-    STX,
-    STY,
-    TAX,
-    TAY,
-    TSX,
-    TXA,
-    TXS,
-    TYA,
-}
-
-#[derive(Debug, Copy, Clone, Eq, PartialEq)]
-pub enum Addressing {
-    Immediate,
-    ZeroPage,
-    ZeroPageX,
-    ZeroPageY,
-    Relative,
-    Absolute,
-    AbsoluteX,
-    AbsoluteY,
-    Indirect,
-    IndirectX,
-    IndirectY,
-    Implied,
-}
-
-#[derive(Debug, Copy, Clone, Eq, PartialEq)]
-pub struct Instruction {
-    mnemonic: Mnemonic,
-    operand: Option<Operand>,
-    addressing: Addressing,
-    pos: usize,
-    len: usize,
-    cycles: usize,
-}
-
-impl Instruction {
-    pub fn immediate(&self) -> Option<u8> {
-        match self.operand {
-            Some(Operand::Immediate(x)) => Some(x),
-            _ => None
-        }
-    }
-
-    pub fn memory(&self) -> Option<Address> {
-        match self.operand {
-            Some(Operand::Memory(x)) => Some(x),
-            _ => None
-        }
-    }
-
-    pub fn branch(&self, start: Address) -> Option<Address> {
-        match self.operand {
-            Some(Operand::Branch(x)) => Some((start as i16 + x as i16) as Address),
-            _ => None
-        }
-    }
-}
-
-impl Display for Instruction {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        let mut pos = self.pos + self.len;
-        if let Some(start) = f.width() {
-            pos += start;
-        }
-        Debug::fmt(&self.mnemonic, f)?;
-        match self.addressing {
-            Addressing::Immediate => f.write_fmt(format_args!(" #${:02X}", self.immediate().unwrap())),
-            Addressing::ZeroPage => f.write_fmt(format_args!(" ${:02X}", self.memory().unwrap())),
-            Addressing::ZeroPageX => f.write_fmt(format_args!(" ${:02X},X", self.memory().unwrap())),
-            Addressing::ZeroPageY => f.write_fmt(format_args!(" ${:02X},Y", self.memory().unwrap())),
-            Addressing::Relative => f.write_fmt(format_args!(" ${:04X}", self.branch(pos as u16).unwrap())),
-            Addressing::Absolute => f.write_fmt(format_args!(" ${:04X}", self.memory().unwrap())),
-            Addressing::AbsoluteX => f.write_fmt(format_args!(" ${:04X},X", self.memory().unwrap())),
-            Addressing::AbsoluteY => f.write_fmt(format_args!(" ${:04X},Y", self.memory().unwrap())),
-            Addressing::Indirect => f.write_fmt(format_args!(" (${:04X})", self.memory().unwrap())),
-            Addressing::IndirectX => f.write_fmt(format_args!(" (${:04X},X)", self.memory().unwrap())),
-            Addressing::IndirectY => f.write_fmt(format_args!(" (${:04X}),Y", self.memory().unwrap())),
-            Addressing::Implied => Ok(()),
-        }
-    }
-}
-
-pub struct Decoder<'a> {
-    buf: &'a [u8],
-    pos: usize,
-    lookup: HashMap<u8, (Mnemonic, Addressing, usize)>,
-}
-
-impl<'a> Decoder<'a> {
-    pub fn new(buf: &'a [u8]) -> Self {
-        Decoder {
-            buf,
-            pos: 0,
-            lookup: Self::build_lookup_table(),
-        }
-    }
-
-    pub fn decode(&mut self) -> Result<Instruction, String> {
-        let start = self.pos;
-        let opcode = self.fetch_next_u8()?;
-
-        match self.lookup.get(&opcode).cloned() {
-            Some((mnemonic, addressing, cycles)) => {
-                Ok(Instruction {
-                    mnemonic,
-                    operand: self.fetch_operand(addressing)?,
-                    addressing,
-                    pos: start as usize,
-                    len: self.pos - start,
-                    cycles,
-                })
-            }
-            None => Err(format!("Can't decode instruction at ${:04x}: ${:02x}", start, opcode)),
-        }
-    }
-
-    pub fn can_decode(&self) -> bool {
-        self.pos < self.buf.len()
-    }
-
-    fn fetch_operand(&mut self, addressing: Addressing) -> Result<Option<Operand>, String> {
-        match addressing {
-            Addressing::Immediate => Ok(Some(Operand::Immediate(self.fetch_next_u8()?))),
-            Addressing::ZeroPage |
-            Addressing::ZeroPageX |
-            Addressing::ZeroPageY => Ok(Some(Operand::Memory(self.fetch_next_u8()? as u16))),
-            Addressing::Absolute |
-            Addressing::AbsoluteX |
-            Addressing::AbsoluteY |
-            Addressing::Indirect => Ok(Some(Operand::Memory(self.fetch_next_u16()?))),
-            Addressing::IndirectX |
-            Addressing::IndirectY => Ok(Some(Operand::Memory(self.fetch_next_u8()? as u16))),
-            Addressing::Relative => Ok(Some(Operand::Branch(self.fetch_next_u8()? as i8))),
-            Addressing::Implied => Ok(None),
-        }
-    }
-
-    fn fetch_u8(&self, position: u16) -> Result<u8, String> {
-        self.buf.get(position as usize).cloned().ok_or(format!("Can't fetch u8 at position ${:04X}", position))
-    }
-
-    fn fetch_next_u8(&mut self) -> Result<u8, String> {
-        let value = self.fetch_u8(self.pos as u16)?;
-        self.pos += 1;
-        Ok(value)
-    }
-
-    fn fetch_next_u16(&mut self) -> Result<u16, String> {
-        let lo = self.fetch_next_u8()? as u16;
-        let hi = self.fetch_next_u8()? as u16;
-        Ok(hi << 8 | lo)
-    }
-
-    fn build_lookup_table() -> HashMap<u8, (Mnemonic, Addressing, usize)> {
+lazy_static! {
+    static ref INSTRUCTION_LOOKUP_TABLE: HashMap<u8, (Mnemonic, Addressing, usize)> = {
         use Mnemonic::*;
         use Addressing::*;
 
@@ -411,6 +204,220 @@ impl<'a> Decoder<'a> {
         // @formatter:on
 
         map
+    };
+}
+
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+pub enum Operand {
+    Immediate(u8),
+    Memory(Address),
+    Branch(Address),
+}
+
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+pub enum Mnemonic {
+    ADC,
+    AND,
+    ASL,
+    BCC,
+    BCS,
+    BEQ,
+    BIT,
+    BMI,
+    BNE,
+    BPL,
+    BRK,
+    BVC,
+    BVS,
+    CLC,
+    CLD,
+    CLI,
+    CLV,
+    CMP,
+    CPX,
+    CPY,
+    DEC,
+    DEX,
+    DEY,
+    EOR,
+    INC,
+    INX,
+    INY,
+    JMP,
+    JSR,
+    LDA,
+    LDX,
+    LDY,
+    SLR,
+    NOP,
+    ORA,
+    PHA,
+    PHP,
+    PLA,
+    PLP,
+    ROL,
+    ROR,
+    RTI,
+    RTS,
+    SBC,
+    SEC,
+    SED,
+    SEI,
+    STA,
+    STX,
+    STY,
+    TAX,
+    TAY,
+    TSX,
+    TXA,
+    TXS,
+    TYA,
+}
+
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+pub enum Addressing {
+    Immediate,
+    ZeroPage,
+    ZeroPageX,
+    ZeroPageY,
+    Relative,
+    Absolute,
+    AbsoluteX,
+    AbsoluteY,
+    Indirect,
+    IndirectX,
+    IndirectY,
+    Implied,
+}
+
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+pub struct Instruction {
+    mnemonic: Mnemonic,
+    operand: Option<Operand>,
+    addressing: Addressing,
+    pos: u16,
+    len: u16,
+    cycles: usize,
+}
+
+impl Instruction {
+    pub fn immediate(&self) -> Option<u8> {
+        match self.operand {
+            Some(Operand::Immediate(x)) => Some(x),
+            _ => None
+        }
+    }
+
+    pub fn memory(&self) -> Option<Address> {
+        match self.operand {
+            Some(Operand::Memory(x)) => Some(x),
+            _ => None
+        }
+    }
+
+    pub fn branch(&self, start: Address) -> Option<Address> {
+        match self.operand {
+            Some(Operand::Branch(x)) => Some((start as i16 + x as i16) as Address),
+            _ => None
+        }
+    }
+}
+
+impl Display for Instruction {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        let mut pos = self.pos + self.len;
+        if let Some(start) = f.width() {
+            pos += start as u16;
+        }
+        Debug::fmt(&self.mnemonic, f)?;
+        match self.addressing {
+            Addressing::Immediate => f.write_fmt(format_args!(" #${:02X}", self.immediate().unwrap())),
+            Addressing::ZeroPage => f.write_fmt(format_args!(" ${:02X}", self.memory().unwrap())),
+            Addressing::ZeroPageX => f.write_fmt(format_args!(" ${:02X},X", self.memory().unwrap())),
+            Addressing::ZeroPageY => f.write_fmt(format_args!(" ${:02X},Y", self.memory().unwrap())),
+            Addressing::Relative => f.write_fmt(format_args!(" ${:04X}", self.branch(pos as u16).unwrap())),
+            Addressing::Absolute => f.write_fmt(format_args!(" ${:04X}", self.memory().unwrap())),
+            Addressing::AbsoluteX => f.write_fmt(format_args!(" ${:04X},X", self.memory().unwrap())),
+            Addressing::AbsoluteY => f.write_fmt(format_args!(" ${:04X},Y", self.memory().unwrap())),
+            Addressing::Indirect => f.write_fmt(format_args!(" (${:04X})", self.memory().unwrap())),
+            Addressing::IndirectX => f.write_fmt(format_args!(" (${:04X},X)", self.memory().unwrap())),
+            Addressing::IndirectY => f.write_fmt(format_args!(" (${:04X}),Y", self.memory().unwrap())),
+            Addressing::Implied => Ok(()),
+        }
+    }
+}
+
+pub struct Decoder<T: Read + Seek>(Box<T>);
+
+impl<T: Read + Seek> Iterator for Decoder<T> {
+    type Item = Result<Instruction, Error>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.pos().ok()? >= self.len().ok()? {
+            return None;
+        }
+        let start = self.pos().ok()?;
+        let opcode = self.fetch_next_u8().ok()?;
+        let result = match INSTRUCTION_LOOKUP_TABLE.get(&opcode).cloned() {
+            Some((mnemonic, addressing, cycles)) => {
+                Ok(Instruction {
+                    mnemonic,
+                    operand: self.fetch_operand(addressing).ok()?,
+                    addressing,
+                    pos: start,
+                    len: self.pos().ok()? - start,
+                    cycles,
+                })
+            }
+            None => Err(Error::new(ErrorKind::InvalidData, format!("Can't decode instruction at ${:04x}: ${:02x}", start, opcode))),
+        };
+        Some(result)
+    }
+}
+
+impl<T: Read + Seek> Decoder<T> {
+    pub fn new(inner: T) -> Self {
+        Decoder(Box::new(inner))
+    }
+
+    fn fetch_operand(&mut self, addressing: Addressing) -> Result<Option<Operand>, Error> {
+        match addressing {
+            Addressing::Immediate => Ok(Some(Operand::Immediate(self.fetch_next_u8()?))),
+            Addressing::ZeroPage |
+            Addressing::ZeroPageX |
+            Addressing::ZeroPageY => Ok(Some(Operand::Memory(self.fetch_next_u8()? as u16))),
+            Addressing::Absolute |
+            Addressing::AbsoluteX |
+            Addressing::AbsoluteY |
+            Addressing::Indirect => Ok(Some(Operand::Memory(self.fetch_next_u16()?))),
+            Addressing::IndirectX |
+            Addressing::IndirectY => Ok(Some(Operand::Memory(self.fetch_next_u8()? as u16))),
+            Addressing::Relative => Ok(Some(Operand::Branch(self.fetch_next_u8()? as i8 as u16))),
+            Addressing::Implied => Ok(None),
+        }
+    }
+
+    fn fetch_next_u8(&mut self) -> Result<u8, Error> {
+        self.0.read_u8()
+    }
+
+    fn fetch_next_u16(&mut self) -> Result<u16, Error> {
+        self.0.read_u16::<LittleEndian>()
+    }
+
+    fn pos(&mut self) -> Result<u16, Error> {
+        self.0.stream_position().map(|x| x as u16)
+    }
+
+    fn len(&mut self) -> Result<u16, Error> {
+        let pos = self.0.stream_position()?;
+        let len = self.0.seek(SeekFrom::End(0))?;
+
+        if pos != len {
+            self.0.seek(SeekFrom::Start(pos))?;
+        }
+
+        Ok(len as u16)
     }
 }
 
@@ -418,7 +425,7 @@ impl<'a> Decoder<'a> {
 #[cfg(test)]
 mod tests {
     use std::fs::File;
-    use std::io::{Error, Read, Seek, SeekFrom};
+    use std::io::{Cursor, Error, Read, Seek, SeekFrom};
 
     use crate::decoder::{Addressing, Decoder, Instruction, Mnemonic, Operand};
 
@@ -432,15 +439,14 @@ mod tests {
         file.seek(SeekFrom::Start(REAL_DATA_START as u64))?;
         file.read_to_end(&mut buf)?;
 
-        let mut decoder = Decoder::new(&buf);
         let mut last_decode_succeeded = false;
 
-        while decoder.can_decode() {
-            match decoder.decode() {
+        for instruction in Decoder::new(Cursor::new(&buf)).into_iter() {
+            match instruction {
                 Ok(instruction) => {
-                    print!("${:04X} |", instruction.pos + VIRT_DATA_START);
+                    print!("${:04X} |", instruction.pos + VIRT_DATA_START as u16);
 
-                    let bytes = &buf[instruction.pos..instruction.pos + instruction.len];
+                    let bytes = &buf[instruction.pos as usize..(instruction.pos + instruction.len) as usize];
                     for byte in bytes.iter() {
                         print!(" {:02X}", byte);
                     }
@@ -463,8 +469,8 @@ mod tests {
     }
 
     #[test]
-    fn can_decode_lda() {
-        let mut decoder = Decoder::new(&[
+    fn can_decode_lda() -> Result<(), Error> {
+        let mut decoder = Decoder::new(Cursor::new(&[
             0xA9, 0x01,
             0xA5, 0x02,
             0xB5, 0x03,
@@ -473,78 +479,80 @@ mod tests {
             0xB9, 0x06, 0x60,
             0xA1, 0x07,
             0xB1, 0x08,
-        ]);
+        ]));
 
-        assert_eq!(decoder.decode(), Ok(Instruction {
+        assert_eq!(decoder.next().unwrap()?, Instruction {
             mnemonic: Mnemonic::LDA,
             operand: Some(Operand::Immediate(0x01)),
             addressing: Addressing::Immediate,
             pos: 0,
             len: 2,
             cycles: 2,
-        }));
+        });
 
-        assert_eq!(decoder.decode(), Ok(Instruction {
+        assert_eq!(decoder.next().unwrap()?, Instruction {
             mnemonic: Mnemonic::LDA,
             operand: Some(Operand::Memory(0x02)),
             addressing: Addressing::ZeroPage,
             pos: 2,
             len: 2,
             cycles: 3,
-        }));
+        });
 
-        assert_eq!(decoder.decode(), Ok(Instruction {
+        assert_eq!(decoder.next().unwrap()?, Instruction {
             mnemonic: Mnemonic::LDA,
             operand: Some(Operand::Memory(0x03)),
             addressing: Addressing::ZeroPageX,
             pos: 4,
             len: 2,
             cycles: 4,
-        }));
+        });
 
-        assert_eq!(decoder.decode(), Ok(Instruction {
+        assert_eq!(decoder.next().unwrap()?, Instruction {
             mnemonic: Mnemonic::LDA,
             operand: Some(Operand::Memory(0x4004)),
             addressing: Addressing::Absolute,
             pos: 6,
             len: 3,
             cycles: 4,
-        }));
+        });
 
-        assert_eq!(decoder.decode(), Ok(Instruction {
+        assert_eq!(decoder.next().unwrap()?, Instruction {
             mnemonic: Mnemonic::LDA,
             operand: Some(Operand::Memory(0x5005)),
             addressing: Addressing::AbsoluteX,
             pos: 9,
             len: 3,
             cycles: 4,
-        }));
+        });
 
-        assert_eq!(decoder.decode(), Ok(Instruction {
+        assert_eq!(decoder.next().unwrap()?, Instruction {
             mnemonic: Mnemonic::LDA,
             operand: Some(Operand::Memory(0x6006)),
             addressing: Addressing::AbsoluteY,
             pos: 12,
             len: 3,
             cycles: 4,
-        }));
+        });
 
-        assert_eq!(decoder.decode(), Ok(Instruction {
+        assert_eq!(decoder.next().unwrap()?, Instruction {
             mnemonic: Mnemonic::LDA,
             operand: Some(Operand::Memory(0x07)),
             addressing: Addressing::IndirectX,
             pos: 15,
             len: 2,
             cycles: 6,
-        }));
+        });
 
-        assert_eq!(decoder.decode(), Ok(Instruction {
+        assert_eq!(decoder.next().unwrap()?, Instruction {
             mnemonic: Mnemonic::LDA,
             operand: Some(Operand::Memory(0x08)),
             addressing: Addressing::IndirectY,
             pos: 17,
             len: 2,
             cycles: 5,
-        }));
+        });
+
+        Ok(())
     }
 }

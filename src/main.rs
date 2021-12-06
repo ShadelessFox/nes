@@ -17,6 +17,9 @@ pub mod ram;
 pub mod cartridge;
 pub mod decoder;
 
+#[macro_use]
+extern crate lazy_static;
+
 const CARTRIDGE_PATH: &str = "roms/nestest.nes";
 
 fn main() -> Result<(), Error> {
