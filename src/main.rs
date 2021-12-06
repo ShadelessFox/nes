@@ -15,6 +15,7 @@ pub mod cpu;
 pub mod ppu;
 pub mod ram;
 pub mod cartridge;
+pub mod decoder;
 
 const CARTRIDGE_PATH: &str = "roms/nestest.nes";
 
